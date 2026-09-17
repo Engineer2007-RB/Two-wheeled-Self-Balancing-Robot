@@ -1,0 +1,519 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <MPU6050.h>
+
+MPU6050 mpu;
+
+// ── Pins ──────────────────────────────────────────────────────
+const int PUL1 = 18, DIR1 = 19, ENA1 = 2;
+const int PUL2 = 17, DIR2 = 16, ENA2 = 23;
+const int SDA_PIN = 21, SCL_PIN = 22;
+
+// ── Kalman filter ─────────────────────────────────────────────
+float angle = 0;
+float bias  = 0;
+float P[2][2] = {{1,0},{0,1}};
+float gyroOffsetX = 0;
+unsigned long prevTime = 0;
+
+float Q_angle   = 0.0001f;
+float Q_bias    = 0.00f;
+float R_measure = 100.0f;
+
+// ── Angle PID ─────────────────────────────────────────────────
+float pidOutput  = 0;
+float integral   = 0;
+float Kp = 1.52f;
+float Ki = 5.0f;
+float Kd = 0.003f;
+float setpoint   = 0.0f;   // dynamically trimmed by position PID
+
+const float MAX_INTEGRAL = 100.0f;
+const float FALL_ANGLE   = 45.0f;
+bool robotFallen = false;
+
+// ── Position PID ──────────────────────────────────────────────
+// Uses step-pulse counting as virtual encoder (no hardware encoder needed).
+// Output nudges the angle setpoint to correct drift.
+//
+// How it works:
+//   • stepCallback() increments/decrements positionSteps on every pulse
+//   • positionPID reads positionSteps, computes an angle trim
+//   • The angle loop chases (setpoint + angleTrim) instead of bare setpoint
+//   • If robot drifts forward → positive step count → negative angle trim
+//     → robot leans back slightly → corrects drift
+//
+volatile long positionSteps = 0;   // counts pulses (+fwd / −rev)
+volatile int  currentDir    = 1;   // +1 = forward, -1 = reverse
+
+float posKp = 0.0003f;   // position P gain  (start very small!)
+float posKi = 0.0f;      // position I gain  (usually leave 0)
+float posKd = 0.0001f;   // position D gain  (damps position oscillation)
+float posDerivFiltered = 0.0f;
+const float POS_DERIV_ALPHA = 0.1f;  // 0.0=heavy filter, 1.0=no filter. Start at 0.1
+
+float posIntegral    = 0.0f;
+float lastPosError   = 0.0f;
+float angleTrim      = 0.0f;       // output of position PID → added to setpoint
+
+const float MAX_ANGLE_TRIM   = 5.0f;    // max degrees the position loop can shift setpoint
+const float MAX_POS_INTEGRAL = 5000.0f; // anti-windup for position integral
+n
+// ── Motor control ─────────────────────────────────────────────
+float motorOutput   = 0;
+float MAX_FREQUENCY = 20000.0f;
+float MIN_FREQUENCY = 0.0f;
+float DEADBAND      = 0.020f;
+
+// ── Timing ────────────────────────────────────────────────────
+unsigned long lastControlTime = 0;
+const uint32_t CONTROL_LOOP_TIME = 5;   // 5 ms → 200 Hz
+
+// ── ESP32 timer for stepper pulses ────────────────────────────
+#include "esp_timer.h"
+esp_timer_handle_t stepTimer;
+volatile bool pulseState = false;
+
+// ── WiFi / web server ─────────────────────────────────────────
+const char* ssid     = "I'm Engineer";
+const char* password = "RudraBaldania";
+WebServer server(80);
+String serialInput = "";
+
+// ======================== HELPER FUNCTIONS ========================
+
+void updateStepperFrequency(float frequency) {
+    frequency = constrain(frequency, 0, MAX_FREQUENCY);
+
+    if (frequency < 1.0f) {
+        esp_timer_stop(stepTimer);
+        digitalWrite(PUL1, LOW);
+        digitalWrite(PUL2, LOW);
+        digitalWrite(ENA1, LOW);
+        digitalWrite(ENA2, LOW);
+    } else {
+        if (frequency < MIN_FREQUENCY) frequency = MIN_FREQUENCY;
+        esp_timer_stop(stepTimer);
+        int period_us = (int)(500000.0f / frequency);
+        esp_timer_start_periodic(stepTimer, period_us);
+        digitalWrite(ENA1, HIGH);
+        digitalWrite(ENA2, HIGH);
+    }
+}
+
+// ── Kalman filter ─────────────────────────────────────────────
+float getRoll(float &gyroRate) {
+    int16_t ax, ay, az, gx, gy, gz;
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+
+    float dt = (micros() - prevTime) / 1e6f;
+    prevTime = micros();
+    if (dt <= 0 || dt > 0.05f) dt = 0.005f;
+
+    float accelAngle = atan2(ay, sqrt((float)ax*ax + (float)az*az)) * 180.0f / PI;
+    gyroRate = (gx - gyroOffsetX) / 131.0f;
+
+    // Prediction
+    angle += (gyroRate - bias) * dt;
+    P[0][0] += dt * (dt * P[1][1] - P[0][1] - P[1][0] + Q_angle);
+    P[0][1] -= dt * P[1][1];
+    P[1][0] -= dt * P[1][1];
+    P[1][1] += Q_bias * dt;
+
+    // Update
+    float y = accelAngle - angle;
+    float S = P[0][0] + R_measure;
+    float K[2];
+    K[0] = P[0][0] / S;
+    K[1] = P[1][0] / S;
+    angle += K[0] * y;
+    bias  += K[1] * y;
+    float P00 = P[0][0], P01 = P[0][1];
+    P[0][0] -= K[0] * P00;
+    P[0][1] -= K[0] * P01;
+    P[1][0] -= K[1] * P00;
+    P[1][1] -= K[1] * P01;
+
+    return angle;
+}
+
+// ── Position PID ──────────────────────────────────────────────
+// Call once per control loop.
+// Reads positionSteps (volatile, set in ISR), returns angle trim in degrees.
+//
+// Tuning guide (after angle PID is stable):
+//   1. Set posKp=0, posKi=0, posKd=0 first (position loop OFF).
+//   2. Increase posKp slowly (0.0001 steps) until drift is reduced but not oscillating.
+//   3. Add posKd (0.00005 steps) to damp oscillation.
+//   4. Only add posKi if a steady-state offset remains after Kp+Kd.
+//
+float computePositionPID(float dt) {
+    // Read atomically (disable interrupts briefly on ESP32)
+    portDISABLE_INTERRUPTS();
+    long steps = positionSteps;
+    portENABLE_INTERRUPTS();
+
+    float posError = (float)steps;   // target = 0 steps (stay in place)
+
+    // P
+    float pOut = posKp * posError;
+
+    // I (with anti-windup)
+    posIntegral += posError * dt;
+    posIntegral  = constrain(posIntegral, -MAX_POS_INTEGRAL, MAX_POS_INTEGRAL);
+    float iOut   = posKi * posIntegral;
+
+    // D
+float rawDeriv = (posError - lastPosError) / dt;
+lastPosError = posError;
+posDerivFiltered = POS_DERIV_ALPHA * rawDeriv + (1.0f - POS_DERIV_ALPHA) * posDerivFiltered;
+float dOut = posKd * posDerivFiltered;
+
+    float trim = (pOut + iOut + dOut);   // negative: fwd drift → lean back
+    trim = constrain(trim, -MAX_ANGLE_TRIM, MAX_ANGLE_TRIM);
+    return trim;
+}
+
+// ── Angle PID (accepts explicit setpoint) ────────────────────
+float computePID_withSetpoint(float currentAngle, float gyroRate, float dt, float sp) {
+    float error = sp - currentAngle;
+
+    float Pout = Kp * error;
+
+    integral += error * dt;
+    integral  = constrain(integral, -MAX_INTEGRAL, MAX_INTEGRAL);
+    float Iout = Ki * integral;
+
+    float Dout = -Kd * gyroRate;
+
+    pidOutput = Pout + Iout + Dout;
+    return pidOutput;
+}
+
+// ── Motor mixing ──────────────────────────────────────────────
+void motorMixing(float controlSignal) {
+    motorOutput = controlSignal;
+
+    if (fabs(motorOutput) <= DEADBAND) {
+        updateStepperFrequency(0);
+        return;
+    }
+
+    if (motorOutput > 0) {
+        digitalWrite(DIR1, HIGH);
+        digitalWrite(DIR2, LOW);
+        currentDir = 1;
+    } else {
+        digitalWrite(DIR1, LOW);
+        digitalWrite(DIR2, HIGH);
+        currentDir = -1;
+    }
+
+    float frequency = fabs(motorOutput) * 800.0f;
+    frequency = constrain(frequency, MIN_FREQUENCY, MAX_FREQUENCY);
+    updateStepperFrequency(frequency);
+}
+
+// ── Timer ISR: generate pulses AND count steps ────────────────
+// Every toggle is a half-cycle; a full step = two toggles (rising + falling).
+// We count on rising edge only (pulseState goes LOW→HIGH).
+void IRAM_ATTR stepCallback(void*) {
+    pulseState = !pulseState;
+    digitalWrite(PUL1, pulseState);
+    digitalWrite(PUL2, pulseState);
+
+    // Count position on rising edge of pulse
+    if (pulseState) {
+        positionSteps += currentDir;
+    }
+}
+
+// ── Serial command parser ─────────────────────────────────────
+void processCommand(String cmd) {
+    cmd.trim();
+    if      (cmd.startsWith("KP"))   { Kp = cmd.substring(2).toFloat();         Serial.printf("Kp=%.4f\n", Kp); }
+    else if (cmd.startsWith("KI"))   { Ki = cmd.substring(2).toFloat();         Serial.printf("Ki=%.4f\n", Ki); }
+    else if (cmd.startsWith("KD"))   { Kd = cmd.substring(2).toFloat();         Serial.printf("Kd=%.4f\n", Kd); }
+    else if (cmd.startsWith("SP"))   { setpoint = cmd.substring(2).toFloat();   Serial.printf("Setpoint=%.2f\n", setpoint); }
+    else if (cmd.startsWith("MAXF")) { MAX_FREQUENCY = cmd.substring(4).toFloat(); Serial.printf("MaxFreq=%.0f\n", MAX_FREQUENCY); }
+    else if (cmd.startsWith("MINF")) { MIN_FREQUENCY = cmd.substring(4).toFloat(); Serial.printf("MinFreq=%.0f\n", MIN_FREQUENCY); }
+    else if (cmd.startsWith("DB"))   { DEADBAND = cmd.substring(2).toFloat();   Serial.printf("Deadband=%.4f\n", DEADBAND); }
+    else if (cmd.startsWith("QA"))   { Q_angle   = cmd.substring(2).toFloat();  Serial.printf("Q_angle=%.6f\n", Q_angle); }
+    else if (cmd.startsWith("QB"))   { Q_bias    = cmd.substring(2).toFloat();  Serial.printf("Q_bias=%.6f\n", Q_bias); }
+    else if (cmd.startsWith("RM"))   { R_measure = cmd.substring(2).toFloat();  Serial.printf("R_measure=%.6f\n", R_measure); }
+    // ── NEW: Position PID commands ──
+    else if (cmd.startsWith("PKP"))  { posKp = cmd.substring(3).toFloat();      Serial.printf("posKp=%.6f\n", posKp); }
+    else if (cmd.startsWith("PKI"))  { posKi = cmd.substring(3).toFloat();      Serial.printf("posKi=%.6f\n", posKi); }
+    else if (cmd.startsWith("PKD"))  { posKd = cmd.substring(3).toFloat();      Serial.printf("posKd=%.6f\n", posKd); }
+    else if (cmd == "RESETPOS")      { portDISABLE_INTERRUPTS(); positionSteps = 0; posIntegral = 0; lastPosError = 0; portENABLE_INTERRUPTS();
+                                       Serial.println("Position reset to 0"); }
+    else if (cmd == "SHOW")  {
+        Serial.printf("Angle PID: Kp=%.4f Ki=%.4f Kd=%.4f Setpoint=%.2f\n", Kp, Ki, Kd, setpoint);
+        Serial.printf("Motor: MaxFreq=%.0f MinFreq=%.0f Deadband=%.4f\n", MAX_FREQUENCY, MIN_FREQUENCY, DEADBAND);
+    }
+    else if (cmd == "SHOWK") { Serial.printf("Kalman: Q_angle=%.6f Q_bias=%.6f R_measure=%.6f\n", Q_angle, Q_bias, R_measure); }
+    else if (cmd == "SHOWP") { Serial.printf("Pos PID: posKp=%.6f posKi=%.6f posKd=%.6f | Steps=%ld AngleTrim=%.3f\n",
+                                             posKp, posKi, posKd, positionSteps, angleTrim); }
+    else { Serial.println("Unknown command"); }
+}
+
+void readPIDCommands() {
+    while (Serial.available()) {
+        char c = Serial.read();
+        if (c == '\n') { processCommand(serialInput); serialInput = ""; }
+        else { serialInput += c; }
+    }
+}
+
+// ── Web server handlers ───────────────────────────────────────
+void handleRoot() {
+    String page = R"rawliteral(
+<!DOCTYPE html><html><head>
+<title>Balancing Robot Tuning</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+body{font-family:Arial;text-align:center;margin:20px;background:#f4f4f4;}
+.card{background:#fff;border-radius:10px;padding:18px;margin:0 auto 16px;max-width:420px;box-shadow:0 1px 4px rgba(0,0,0,.08);text-align:left;}
+.card h3{margin:0 0 14px;font-size:14px;color:#666;border-bottom:1px solid #eee;padding-bottom:8px;}
+.row{display:flex;align-items:center;margin-bottom:10px;gap:10px;}
+.row label{min-width:140px;font-size:14px;font-weight:500;}
+.row input{flex:1;padding:7px;border:1px solid #ddd;border-radius:6px;font-size:14px;}
+.btn{display:block;width:100%;padding:10px;background:#333;color:#fff;border:none;border-radius:6px;cursor:pointer;margin-top:8px;font-size:14px;}
+.btn:hover{background:#555;}
+.btn-red{background:#c0392b;} .btn-red:hover{background:#e74c3c;}
+.pills{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px;}
+.pill{background:#f0f0f0;border-radius:6px;padding:4px 10px;font-size:12px;color:#555;}
+.pill b{color:#222;}
+.note{font-size:12px;color:#888;margin-top:8px;text-align:center;}
+</style>
+</head><body>
+<h2>ESP32 Balance Bot</h2>
+<p class="note">Live tuning | Changes apply immediately</p>
+
+<!-- Angle PID -->
+<div class="card">
+  <h3>🎯 Angle PID Controller</h3>
+  <form action="/setPID">
+    <div class="row"><label>Kp (Proportional)</label><input type="number" step="0.001" name="kp" value=")rawliteral";
+    page += String(Kp,4); page += R"rawliteral("></div>
+    <div class="row"><label>Ki (Integral)</label><input type="number" step="0.001" name="ki" value=")rawliteral";
+    page += String(Ki,4); page += R"rawliteral("></div>
+    <div class="row"><label>Kd (Derivative)</label><input type="number" step="0.001" name="kd" value=")rawliteral";
+    page += String(Kd,4); page += R"rawliteral("></div>
+    <div class="row"><label>Setpoint (degrees)</label><input type="number" step="0.5" name="sp" value=")rawliteral";
+    page += String(setpoint,1); page += R"rawliteral("></div>
+    <button class="btn" type="submit">Update Angle PID</button>
+  </form>
+</div>
+
+<!-- Position PID -->
+<div class="card">
+  <h3>📍 Position PID (Drift Control)</h3>
+  <p style="font-size:12px;color:#888;margin:0 0 10px;">Nudges angle setpoint to prevent walking. Tune AFTER angle PID is stable.</p>
+  <form action="/setPosPID">
+    <div class="row"><label>posKp</label><input type="number" step="0.00001" name="pkp" value=")rawliteral";
+    page += String(posKp,6); page += R"rawliteral("></div>
+    <div class="row"><label>posKi</label><input type="number" step="0.00001" name="pki" value=")rawliteral";
+    page += String(posKi,6); page += R"rawliteral("></div>
+    <div class="row"><label>posKd</label><input type="number" step="0.00001" name="pkd" value=")rawliteral";
+    page += String(posKd,6); page += R"rawliteral("></div>
+    <button class="btn" type="submit">Update Position PID</button>
+  </form>
+  <form action="/resetPos" style="margin-top:8px">
+    <button class="btn btn-red" type="submit">🔄 Reset Position to Zero</button>
+  </form>
+  <div class="pills" style="margin-top:10px">
+    <div class="pill">posKp <b>)rawliteral"; page += String(posKp,6); page += R"rawliteral(</b></div>
+    <div class="pill">posKi <b>)rawliteral"; page += String(posKi,6); page += R"rawliteral(</b></div>
+    <div class="pill">posKd <b>)rawliteral"; page += String(posKd,6); page += R"rawliteral(</b></div>
+  </div>
+</div>
+
+<!-- Motor Config -->
+<div class="card">
+  <h3>⚙️ Motor Parameters</h3>
+  <form action="/setMotor">
+    <div class="row"><label>Max Frequency (Hz)</label><input type="number" step="1000" name="maxf" value=")rawliteral";
+    page += String(MAX_FREQUENCY,0); page += R"rawliteral("></div>
+    <div class="row"><label>Min Frequency (Hz)</label><input type="number" step="10" name="minf" value=")rawliteral";
+    page += String(MIN_FREQUENCY,0); page += R"rawliteral("></div>
+    <div class="row"><label>Deadband</label><input type="number" step="0.001" name="db" value=")rawliteral";
+    page += String(DEADBAND,4); page += R"rawliteral("></div>
+    <button class="btn" type="submit">Update Motor</button>
+  </form>
+</div>
+
+<!-- Kalman -->
+<div class="card">
+  <h3>🔮 Kalman Filter</h3>
+  <form action="/setKalman">
+    <div class="row"><label>Q_angle</label><input type="number" step="0.0001" name="qa" value=")rawliteral";
+    page += String(Q_angle,6); page += R"rawliteral("></div>
+    <div class="row"><label>Q_bias</label><input type="number" step="0.0001" name="qb" value=")rawliteral";
+    page += String(Q_bias,6); page += R"rawliteral("></div>
+    <div class="row"><label>R_measure</label><input type="number" step="0.001" name="rm" value=")rawliteral";
+    page += String(R_measure,6); page += R"rawliteral("></div>
+    <button class="btn" type="submit">Update Kalman</button>
+  </form>
+</div>
+
+<p class="note">💡 Position PID tuning order: posKp → posKd → posKi (if needed)</p>
+<p class="note">Serial: SHOWP to monitor steps & trim | RESETPOS to zero position</p>
+</body></html>)rawliteral";
+    server.send(200, "text/html", page);
+}
+
+void handleSetPID() {
+    if (server.hasArg("kp")) Kp = server.arg("kp").toFloat();
+    if (server.hasArg("ki")) Ki = server.arg("ki").toFloat();
+    if (server.hasArg("kd")) Kd = server.arg("kd").toFloat();
+    if (server.hasArg("sp")) setpoint = server.arg("sp").toFloat();
+    integral = 0;
+    Serial.printf("Angle PID: Kp=%.4f Ki=%.4f Kd=%.4f Setpoint=%.2f\n", Kp, Ki, Kd, setpoint);
+    server.sendHeader("Location", "/"); server.send(303);
+}
+
+void handleSetPosPID() {
+    if (server.hasArg("pkp")) posKp = server.arg("pkp").toFloat();
+    if (server.hasArg("pki")) posKi = server.arg("pki").toFloat();
+    if (server.hasArg("pkd")) posKd = server.arg("pkd").toFloat();
+    posIntegral = 0;
+    Serial.printf("Pos PID: posKp=%.6f posKi=%.6f posKd=%.6f\n", posKp, posKi, posKd);
+    server.sendHeader("Location", "/"); server.send(303);
+}
+
+void handleResetPos() {
+    portDISABLE_INTERRUPTS();
+    positionSteps = 0;
+    posIntegral   = 0;
+    lastPosError  = 0;
+    portENABLE_INTERRUPTS();
+    Serial.println("Position reset to 0");
+    server.sendHeader("Location", "/"); server.send(303);
+}
+
+void handleSetMotor() {
+    if (server.hasArg("maxf")) MAX_FREQUENCY = server.arg("maxf").toFloat();
+    if (server.hasArg("minf")) MIN_FREQUENCY = server.arg("minf").toFloat();
+    if (server.hasArg("db"))   DEADBAND      = server.arg("db").toFloat();
+    Serial.printf("Motor: MaxFreq=%.0f MinFreq=%.0f Deadband=%.4f\n", MAX_FREQUENCY, MIN_FREQUENCY, DEADBAND);
+    server.sendHeader("Location", "/"); server.send(303);
+}
+
+void handleSetKalman() {
+    if (server.hasArg("qa")) Q_angle   = server.arg("qa").toFloat();
+    if (server.hasArg("qb")) Q_bias    = server.arg("qb").toFloat();
+    if (server.hasArg("rm")) R_measure = server.arg("rm").toFloat();
+    Serial.printf("Kalman: Qa=%.6f Qb=%.6f Rm=%.6f\n", Q_angle, Q_bias, R_measure);
+    server.sendHeader("Location", "/"); server.send(303);
+}
+
+// ======================== SETUP ========================
+void setup() {
+    Serial.begin(115200);
+
+    pinMode(PUL1, OUTPUT); pinMode(PUL2, OUTPUT);
+    pinMode(DIR1, OUTPUT); pinMode(DIR2, OUTPUT);
+    pinMode(ENA1, OUTPUT); pinMode(ENA2, OUTPUT);
+    digitalWrite(ENA1, LOW);
+    digitalWrite(ENA2, LOW);
+    digitalWrite(PUL1, LOW);
+    digitalWrite(PUL2, LOW);
+
+    Wire.begin(SDA_PIN, SCL_PIN);
+    Wire.setClock(400000);
+    mpu.initialize();
+    mpu.setDLPFMode(3);
+
+    Serial.println("Calibrating gyro... keep robot still");
+    delay(2000);
+    long sum = 0;
+    int16_t ax, ay, az, gx, gy, gz;
+    for (int i = 0; i < 2000; i++) {
+        mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+        sum += gx;
+        delay(2);
+    }
+    gyroOffsetX = sum / 2000.0f;
+    Serial.printf("Gyro offset: %.2f\n", gyroOffsetX);
+
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+    angle = atan2(ay, sqrt((float)ax*ax + (float)az*az)) * 180.0f / PI;
+    prevTime = micros();
+
+    const esp_timer_create_args_t timerArgs = {
+        .callback = &stepCallback,
+        .arg = NULL,
+        .name = "stepperTimer"
+    };
+    esp_timer_create(&timerArgs, &stepTimer);
+
+    WiFi.begin(ssid, password);
+    Serial.print("Connecting to WiFi");
+    while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+    Serial.printf("\nConnected. IP: %s\n", WiFi.localIP().toString().c_str());
+
+    server.on("/",          handleRoot);
+    server.on("/setPID",    handleSetPID);
+    server.on("/setPosPID", handleSetPosPID);   // NEW
+    server.on("/resetPos",  handleResetPos);    // NEW
+    server.on("/setMotor",  handleSetMotor);
+    server.on("/setKalman", handleSetKalman);
+    server.begin();
+
+    Serial.println("\nRobot ready.");
+    Serial.println("─── Serial Commands ───────────────────────────────────────");
+    Serial.println("Angle PID : KP / KI / KD / SP");
+    Serial.println("Pos PID   : PKP / PKI / PKD   (e.g. PKP0.0003)");
+    Serial.println("Motor     : MAXF / MINF / DB");
+    Serial.println("Kalman    : QA / QB / RM");
+    Serial.println("Util      : SHOW / SHOWK / SHOWP / RESETPOS");
+    Serial.println("───────────────────────────────────────────────────────────");
+}
+
+// ======================== LOOP ========================
+void loop() {
+    server.handleClient();
+    readPIDCommands();
+
+    unsigned long now = millis();
+    if (now - lastControlTime >= CONTROL_LOOP_TIME) {
+        float dt = (now - lastControlTime) / 1000.0f;
+        lastControlTime = now;
+
+        float gyroRate    = 0;
+        float currentAngle = getRoll(gyroRate);
+
+        // Fall detection
+        if (fabs(currentAngle) > FALL_ANGLE) {
+            if (!robotFallen) {
+                robotFallen = true;
+                integral = 0;
+                updateStepperFrequency(0);
+                Serial.println("FALLEN – motors disabled");
+            }
+        } else {
+            robotFallen = false;
+        }
+
+        if (!robotFallen) {
+            // ── Position PID: compute angle trim from step count ──
+            angleTrim = computePositionPID(dt);
+
+            // ── Angle PID: chase (setpoint + position trim) ───────
+            float adjustedSetpoint = setpoint + angleTrim;
+            float controlSignal = computePID_withSetpoint(currentAngle, gyroRate, dt, adjustedSetpoint);
+
+            motorMixing(controlSignal);
+        }
+
+        // Serial plotter (uncomment to monitor):
+        // Serial.print("Angle:"); Serial.print(currentAngle, 2);
+        // Serial.print(",Trim:"); Serial.print(angleTrim, 3);
+        // Serial.print(",Steps:"); Serial.print(positionSteps);
+        // Serial.print(",PID:"); Serial.println(pidOutput, 2);
+    }
+}
+
+

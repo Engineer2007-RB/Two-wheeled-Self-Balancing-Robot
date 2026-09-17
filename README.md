@@ -1,4 +1,3 @@
 # Two-wheeled-Self-Balancing-Robot
-This is the first Github Repository created by Rudra Baldania
-<br>
-<p color = "Red">Author - Rudra Baldania</p>
+
+Video Link - https://youtu.be/NJXGk5FJnFY?si=8602L5Uh5Y0yVG3H
